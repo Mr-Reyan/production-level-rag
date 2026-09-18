@@ -1,6 +1,6 @@
 "use client";
 
-import { FileIcon, XIcon } from "./icons";
+import { FileIcon, XIcon, SparkIcon } from "./icons";
 
 
 

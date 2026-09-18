@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { SendIcon, FileIcon } from "./icons";
 
-export function EmptyState({ ready }) {
+export function EmptyState({ ready, onSelectSuggestion }) {
   const suggestions = [
     "Summarize this document in 3 bullets.",
     "What are the key takeaways?",
@@ -27,7 +27,11 @@ export function EmptyState({ ready }) {
       {ready && (
         <div className="mt-8 grid w-full gap-2 sm:grid-cols-3">
           {suggestions.map((s) => (
-            <SuggestionChip key={s} label={s} />
+            <SuggestionChip
+              key={s}
+              label={s}
+              onSelect={() => onSelectSuggestion?.(s)}
+            />
           ))}
         </div>
       )}
@@ -35,25 +39,12 @@ export function EmptyState({ ready }) {
   );
 }
 
-function SuggestionChip({ label }) {
+function SuggestionChip({ label, onSelect }) {
   return (
     <button
       type="button"
       className="rounded-xl border border-neutral-200 bg-white px-3 py-2.5 text-left text-xs text-neutral-700 transition hover:border-neutral-300 hover:bg-neutral-50"
-      onClick={() => {
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "textarea[data-composer]"
-        );
-        if (input) {
-          const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype,
-            "value"
-          )?.set;
-          setter?.call(input, label);
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-          input.focus();
-        }
-      }}
+      onClick={onSelect}
     >
       {label}
     </button>
@@ -117,10 +108,10 @@ export function AssistantBubble({
                   >
                     <div className="mb-1.5 flex items-center justify-between text-[11px] text-neutral-500">
                       <span className="rounded-md bg-neutral-100 px-1.5 py-0.5 font-mono">
-                        {(s.similarity * 100).toFixed(1)}% match
+                        {((Number(s.similarity) || 0) * 100).toFixed(1)}% match
                       </span>
                       <span className="font-mono">
-                        #{s.source_id.slice(0, 6)}
+                        #{s.source_id ? String(s.source_id).slice(0, 6) : "source"}
                       </span>
                     </div>
                     <p className="line-clamp-5 whitespace-pre-wrap text-xs leading-relaxed text-neutral-700">

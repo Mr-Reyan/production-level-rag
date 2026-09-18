@@ -30,7 +30,7 @@ SECRET_KEY = "django-insecure-iad+@x3y1(@8qazf9il1%_yydv1hsucu=@ue46mmf64fm6+*ho
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["*"]
 
 
 # Application definition
@@ -140,7 +140,11 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000"
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 
-OLLAMA_URL = 'http://localhost:11434'
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
