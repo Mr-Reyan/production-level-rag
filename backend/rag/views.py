@@ -6,9 +6,11 @@ from django.db import connection
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
-
-from .models import Document
-from .services import chunk_text, embed, extract_text_from_pdf
+from django.shortcuts import get_object_or_404
+from django.db import transaction
+from rag.models import Document, Chats, Message
+from rag.services import chunk_text, embed, extract_text_from_pdf, derive_chat_title
+import uuid
 
 
 @csrf_exempt
@@ -21,12 +23,16 @@ def add_document(request):
 
     title = body.get("title", "").strip()
     content = body.get("content", "").strip()
+    chat_id = body.get("chat_id", "").strip()
     if not title or not content:
-        return JsonResponse({"error": "'title' and 'content' are required fields"}, status=400)
+        return JsonResponse(
+            {"error": "'title' and 'content' are required fields"}, status=400
+        )
 
     try:
         query_vector = embed(content)
         doc = Document.objects.create(
+            chat_id=chat_id,
             title=title,
             content=content,
             embedding=query_vector,
@@ -65,7 +71,9 @@ def search(request):
             )
             rows = cur.fetchall()
 
-        results = [{"id": r[0], "content": r[1], "similarity": float(r[2])} for r in rows]
+        results = [
+            {"id": r[0], "content": r[1], "similarity": float(r[2])} for r in rows
+        ]
         return JsonResponse({"results": results})
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
@@ -78,6 +86,7 @@ def upload_pdf(request):
         return JsonResponse({"error": "No file provided under 'file' key"}, status=400)
 
     pdf_file = request.FILES["file"]
+
     if not pdf_file.name.lower().endswith(".pdf"):
         return JsonResponse({"error": "Only PDF files are supported"}, status=400)
 
@@ -85,6 +94,7 @@ def upload_pdf(request):
 
     try:
         text = extract_text_from_pdf(pdf_file)
+        chat_title = derive_chat_title(pdf_file)
     except Exception as e:
         return JsonResponse({"error": f"Failed to parse PDF: {str(e)}"}, status=400)
 
@@ -102,31 +112,38 @@ def upload_pdf(request):
             {"error": "No text chunks could be generated from the document."},
             status=400,
         )
-
+    chat_id = request.data.get("chat_id")
     try:
-        created_docs = []
-        for i, chunk in enumerate(chunks):
-            embedding = embed(chunk)
-            created_docs.append(
+        with transaction.atomic():
+            if chat_id:
+                chat = get_object_or_404(Chats, id=chat_id)
+            else:
+                chat = Chats.objects.create(title=chat_title)
+
+            created_docs = [
                 Document(
+                    chat=chat,
                     title=pdf_file.name,
                     content=chunk,
-                    embedding=embedding,
+                    embedding=embed(chunk),
                     source_id=source_id,
                     chunk_index=i,
                 )
-            )
-        Document.objects.bulk_create(created_docs)
-        return JsonResponse(
-            {
-                "source_id": str(source_id),
-                "title": pdf_file.name,
-                "chunks": len(chunks),
-            },
-            status=201,
-        )
+                for i, chunk in enumerate(chunks)
+            ]
+            Document.objects.bulk_create(created_docs)
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
+
+    return JsonResponse(
+        {
+            "chat_id": str(chat.id),
+            "source_id": str(source_id),
+            "title": pdf_file.name,
+            "chunks": len(chunks),
+        },
+        status=201,
+    )
 
 
 @csrf_exempt
@@ -138,10 +155,14 @@ def ask(request):
         return JsonResponse({"error": "Invalid JSON body"}, status=400)
 
     question = body.get("question", "").strip()
+    chat_id = body.get("chat_id")
+    chat = get_object_or_404(Chats, id=chat_id)
+
     if not question:
         return JsonResponse({"error": "'question' is required"}, status=400)
 
     try:
+        Message.objects.create(chat=chat, text=question, sender="user")
         query_vector = embed(question)
         with connection.cursor() as c:
             c.execute(
@@ -163,10 +184,12 @@ def ask(request):
         return JsonResponse({"error": f"Search failed: {str(e)}"}, status=500)
 
     if not chunks:
-        return JsonResponse({
-            "answer": "I don't have any relevant documents to answer this question. Please upload a PDF document first.",
-            "sources": [],
-        })
+        return JsonResponse(
+            {
+                "answer": "I don't have any relevant documents to answer this question. Please upload a PDF document first.",
+                "sources": [],
+            }
+        )
 
     context = "\n\n---\n\n".join(c["content"] for c in chunks)
     prompt = f"""Answer the question based ONLY on the context below.
@@ -203,10 +226,13 @@ Answer:"""
         if not answer:
             answer = "Unable to generate a response from LLM."
 
-        return JsonResponse({
-            "answer": answer,
-            "sources": chunks,
-        })
+        Message.objects.create(chat=chat, text=answer, sender="ai")
+        return JsonResponse(
+            {
+                "answer": answer,
+                "sources": chunks,
+            }
+        )
     except requests.exceptions.ConnectionError:
         return JsonResponse(
             {
@@ -221,3 +247,12 @@ Answer:"""
         )
     except Exception as e:
         return JsonResponse({"error": f"Generation error: {str(e)}"}, status=500)
+
+
+@csrf_exempt
+@api_view(["GET"])
+def get_chat_messages(request):
+    chat_id = request.data.get("chat_id")
+    chat = get_object_or_404(Chats, id=chat_id)
+    messages = chat.messages.all()
+    return JsonResponse({"messages": messages})
