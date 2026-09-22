@@ -1,13 +1,24 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import { SendIcon, FileIcon } from "./icons";
 
-export function EmptyState({ ready, onSelectSuggestion }) {
+const composerFormSchema = z.object({
+  question: z
+    .string()
+    .trim()
+    .min(1, { message: "Question cannot be empty" })
+    .max(2000, { message: "Question is too long (max 2000 chars)" }),
+});
+
+export function EmptyState({ ready, onSelectSuggestion, chatTitle }) {
   const suggestions = [
     "Summarize this document in 3 bullets.",
     "What are the key takeaways?",
-    "List any dates or deadlines mentioned.",
+    "List any dates, names, or numbers mentioned.",
   ];
 
   return (
@@ -16,12 +27,12 @@ export function EmptyState({ ready, onSelectSuggestion }) {
         <SparkIconLarge />
       </div>
       <h2 className="mt-5 text-xl font-semibold tracking-tight">
-        {ready ? "Ask anything about your document" : "Upload a PDF to begin"}
+        {ready ? (chatTitle || "Ask anything about this document") : "Upload a PDF to begin"}
       </h2>
       <p className="mt-2 max-w-md text-sm leading-relaxed text-neutral-500">
         {ready
-          ? "Answers are grounded in the content of your PDF. Sources are cited below each response."
-          : "Once uploaded, we chunk, embed, and index it so you can ask questions directly."}
+          ? "Answers are strictly isolated and grounded in the documents uploaded to this chat."
+          : "Upload a PDF from the sidebar or click browse to create a new chat and index the text."}
       </p>
 
       {ready && (
@@ -71,10 +82,7 @@ export function UserBubble({ text }) {
   );
 }
 
-export function AssistantBubble({
-  text,
-  sources,
-}) {
+export function AssistantBubble({ text, sources = [] }) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -88,7 +96,7 @@ export function AssistantBubble({
           {text}
         </div>
 
-        {sources.length > 0 && (
+        {sources && sources.length > 0 && (
           <div className="mt-3">
             <button
               onClick={() => setOpen((v) => !v)}
@@ -101,17 +109,17 @@ export function AssistantBubble({
 
             {open && (
               <ul className="mt-3 space-y-2">
-                {sources.map((s) => (
+                {sources.map((s, idx) => (
                   <li
-                    key={s.id}
+                    key={s.id || idx}
                     className="rounded-xl border border-neutral-200 bg-white p-3"
                   >
                     <div className="mb-1.5 flex items-center justify-between text-[11px] text-neutral-500">
                       <span className="rounded-md bg-neutral-100 px-1.5 py-0.5 font-mono">
                         {((Number(s.similarity) || 0) * 100).toFixed(1)}% match
                       </span>
-                      <span className="font-mono">
-                        #{s.source_id ? String(s.source_id).slice(0, 6) : "source"}
+                      <span className="font-mono truncate max-w-[200px]">
+                        {s.title || (s.source_id ? `#${String(s.source_id).slice(0, 8)}` : "source")}
                       </span>
                     </div>
                     <p className="line-clamp-5 whitespace-pre-wrap text-xs leading-relaxed text-neutral-700">
@@ -163,62 +171,92 @@ function SparkIconSmall() {
 }
 
 export function Composer({
-  value,
-  onChange,
   onSubmit,
   disabled,
   pending,
   placeholder,
+  externalValue,
+  onExternalChange,
 }) {
+  const {
+    register,
+    handleSubmit,
+    setValue,
+    watch,
+    reset,
+    formState: { errors },
+  } = useForm({
+    resolver: zodResolver(composerFormSchema),
+    defaultValues: { question: "" },
+  });
+
+  // Sync external suggestion click if provided
+  useEffect(() => {
+    if (externalValue) {
+      setValue("question", externalValue, { shouldValidate: true });
+      onExternalChange?.("");
+    }
+  }, [externalValue, setValue, onExternalChange]);
+
+  const questionValue = watch("question");
+
+  const onFormSubmit = (data) => {
+    if (disabled || pending) return;
+    onSubmit(data.question);
+    reset({ question: "" });
+  };
+
   return (
     <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        onSubmit();
-      }}
-      className="border-t border-neutral-200 bg-white/80 backdrop-blur"
+      onSubmit={handleSubmit(onFormSubmit)}
+      className="border-t border-neutral-200 bg-white/90 backdrop-blur"
     >
-      <div className="mx-auto flex max-w-3xl items-end gap-2 px-3 py-3 sm:px-6 sm:py-4">
-        <div className="relative flex-1">
-          <textarea
-            data-composer
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                onSubmit();
-              }
-            }}
-            rows={1}
-            placeholder={placeholder}
-            disabled={disabled || pending}
+      <div className="mx-auto flex max-w-3xl flex-col px-3 py-3 sm:px-6 sm:py-4">
+        {errors.question && (
+          <p className="mb-2 text-xs text-red-500 font-medium">
+            {errors.question.message}
+          </p>
+        )}
+        <div className="flex items-end gap-2">
+          <div className="relative flex-1">
+            <textarea
+              {...register("question")}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSubmit(onFormSubmit)();
+                }
+              }}
+              rows={1}
+              placeholder={placeholder}
+              disabled={disabled || pending}
+              className="
+                max-h-40 w-full resize-none rounded-2xl border border-neutral-200 bg-white
+                px-4 py-3 pr-12 text-sm leading-relaxed outline-none
+                placeholder:text-neutral-400
+                focus:border-neutral-900 focus:ring-1 focus:ring-neutral-900
+                disabled:cursor-not-allowed disabled:bg-neutral-100
+              "
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={disabled || pending || !questionValue?.trim()}
             className="
-              max-h-40 w-full resize-none rounded-2xl border border-neutral-200 bg-white
-              px-4 py-3 pr-12 text-sm leading-relaxed outline-none
-              placeholder:text-neutral-400
-              focus:border-neutral-900 focus:ring-1 focus:ring-neutral-900
-              disabled:cursor-not-allowed disabled:bg-neutral-100
+              flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl
+              bg-neutral-900 text-white transition
+              hover:bg-neutral-800
+              disabled:cursor-not-allowed disabled:opacity-40
             "
-          />
+            aria-label="Send"
+          >
+            <SendIcon className="h-4 w-4" />
+          </button>
         </div>
-        <button
-          type="submit"
-          disabled={disabled || pending || !value.trim()}
-          className="
-            flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl
-            bg-neutral-900 text-white transition
-            hover:bg-neutral-800
-            disabled:cursor-not-allowed disabled:opacity-40
-          "
-          aria-label="Send"
-        >
-          <SendIcon className="h-4 w-4" />
-        </button>
+        <p className="mt-2 text-center text-[11px] text-neutral-400">
+          Enter to send · Shift + Enter for newline · Validated with Zod
+        </p>
       </div>
-      <p className="mx-auto max-w-3xl px-3 pb-2 text-center text-[11px] text-neutral-400 sm:px-6">
-        Enter to send · Shift + Enter for newline
-      </p>
     </form>
   );
-}
+}

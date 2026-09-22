@@ -1,5 +1,5 @@
+import uuid
 from django.db import models
-from django.forms.fields import CharField
 from pgvector.django import VectorField
 
 # Create your models here.
@@ -11,10 +11,15 @@ SENDER_ROLES = [
 
 
 class Chats(models.Model):
-    id = models.UUIDField(primary_key=True)
-    title = models.CharField(max_length=225)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=255, default="Untitled Chat")
     created_at = models.DateTimeField(auto_now_add=True)
-    deleted_at = models.DateTimeField(default=None)
+    deleted_at = models.DateTimeField(null=True, blank=True, default=None)
+
+    def __str__(self):
+        return f"{self.title} ({self.id})"
+
+
 
 
 class Message(models.Model):
@@ -25,6 +30,9 @@ class Message(models.Model):
 
     class Meta:
         ordering = ["created_at"]
+
+    def __str__(self):
+        return f"[{self.sender}] {self.text[:30]}"
 
 
 class Document(models.Model):
@@ -37,3 +45,7 @@ class Document(models.Model):
     source_id = models.UUIDField(db_index=True)
     chunk_index = models.IntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.title} - Chunk {self.chunk_index}"
+

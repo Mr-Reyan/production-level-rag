@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useUploadPdf, useAsk } from "@/hooks/use-rag";
+import {
+  useChats,
+  useChatDetail,
+  useUploadPdf,
+  useAsk,
+  useDeleteChat,
+} from "@/hooks/use-rag";
 import { Sidebar } from "@/components/Sidebar";
 import {
   AssistantBubble,
@@ -10,129 +16,204 @@ import {
   ThinkingBubble,
   UserBubble,
 } from "@/components/chat";
-import { MenuIcon } from "@/components/icons";
+import { MenuIcon, FileIcon } from "@/components/icons";
 
 export default function Home() {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
-  const [pdfName, setPdfName] = useState(null);
+  const [activeChatId, setActiveChatId] = useState(null);
+  const [suggestion, setSuggestion] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const scrollRef = useRef(null);
 
+  const { data: chatsData, isLoading: chatsLoading } = useChats();
+  const { data: chatDetailData, isLoading: detailLoading } = useChatDetail(activeChatId);
+
   const upload = useUploadPdf();
   const ask = useAsk();
+  const deleteChatMutation = useDeleteChat();
 
+  const chats = chatsData?.chats || [];
+  const currentChat = chatDetailData?.chat || null;
+  const currentMessages = chatDetailData?.messages || [];
+  const currentDocs = chatDetailData?.documents || [];
+
+  // Local optimistic messages state for smooth chat turns
+  const [localMessages, setLocalMessages] = useState([]);
+
+  // Sync loaded messages when switching chats
+  useEffect(() => {
+    if (chatDetailData?.messages) {
+      setLocalMessages(
+        chatDetailData.messages.map((m) => ({
+          role: m.sender === "ai" ? "assistant" : "user",
+          content: m.text,
+          sources: [],
+        }))
+      );
+    } else {
+      setLocalMessages([]);
+    }
+  }, [chatDetailData?.messages, activeChatId]);
+
+  // Auto scroll
   useEffect(() => {
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, ask.isPending]);
+  }, [localMessages, ask.isPending]);
 
-  function handleUpload(file) {
-    setPdfName(file.name);
-    upload.mutate(file, {
+  function handleUpload(file, targetChatId) {
+    upload.mutate(
+      { file, chatId: targetChatId },
+      {
+        onSuccess: (data) => {
+          if (data.chat_id) {
+            setActiveChatId(data.chat_id);
+          }
+          setSidebarOpen(false);
+        },
+      }
+    );
+  }
+
+  function handleNewChat() {
+    setActiveChatId(null);
+    setLocalMessages([]);
+    setSidebarOpen(false);
+  }
+
+  function handleDeleteChat(chatId) {
+    deleteChatMutation.mutate(chatId, {
       onSuccess: () => {
-        setMessages([]);
-        setSidebarOpen(false);
+        if (activeChatId === chatId) {
+          setActiveChatId(null);
+          setLocalMessages([]);
+        }
       },
     });
   }
 
-  function handleReset() {
-    setPdfName(null);
-    setMessages([]);
-    upload.reset();
+  function handleSend(questionText) {
+    const q = questionText?.trim();
+    if (!q || !activeChatId || ask.isPending) return;
+
+    // Add optimistic user message
+    setLocalMessages((m) => [...m, { role: "user", content: q }]);
+
+    ask.mutate(
+      { chatId: activeChatId, question: q },
+      {
+        onSuccess: (data) => {
+          setLocalMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content: data.answer,
+              sources: data.sources || [],
+            },
+          ]);
+        },
+        onError: (err) => {
+          setLocalMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content: `Error: ${err.message}`,
+              sources: [],
+            },
+          ]);
+        },
+      }
+    );
   }
 
-  function handleSend() {
-    const q = input.trim();
-    if (!q || ask.isPending) return;
-
-    setMessages((m) => [...m, { role: "user", content: q }]);
-    setInput("");
-
-    ask.mutate(q, {
-      onSuccess: (data) => {
-        setMessages((m) => [
-          ...m,
-          { role: "assistant", content: data.answer, sources: data.sources || [] },
-        ]);
-      },
-      onError: (err) => {
-        setMessages((m) => [
-          ...m,
-          { role: "assistant", content: `Error: ${err.message}`, sources: [] },
-        ]);
-      },
-    });
-  }
-
-  const ready = !!pdfName && upload.isSuccess;
-  const indexed = upload.data?.chunks ?? 0;
+  const hasChat = !!activeChatId;
+  const isReady = hasChat && currentDocs.length > 0;
 
   return (
-    <div className="flex h-dvh w-full overflow-hidden">
+    <div className="flex h-dvh w-full overflow-hidden bg-neutral-50 text-neutral-900">
       <Sidebar
-        pdfName={pdfName}
-        chunkCount={indexed}
+        chats={chats}
+        activeChatId={activeChatId}
+        onSelectChat={(id) => {
+          setActiveChatId(id);
+          setSidebarOpen(false);
+        }}
+        onNewChat={handleNewChat}
+        onDeleteChat={handleDeleteChat}
+        activeChatDocs={currentDocs}
         uploading={upload.isPending}
         onUpload={handleUpload}
-        onReset={handleReset}
         mobileOpen={sidebarOpen}
         onMobileClose={() => setSidebarOpen(false)}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar */}
-        <header className="flex h-14 items-center gap-3 border-b border-neutral-200 bg-white px-3 sm:px-6">
-          <button
-            onClick={() => setSidebarOpen(true)}
-            className="rounded-lg p-2 text-neutral-600 hover:bg-neutral-100 md:hidden"
-            aria-label="Open menu"
-          >
-            <MenuIcon className="h-5 w-5" />
-          </button>
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-medium">
-              {pdfName ?? "No document"}
-            </div>
-            <div className="truncate text-xs text-neutral-500">
-              {upload.isPending
-                ? "Indexing document…"
-                : upload.isError
-                ? `Upload failed: ${upload.error?.message || "Unknown error"}`
-                : ready
-                ? `${indexed} chunks indexed`
-                : "Upload a PDF to start"}
+        {/* Top Header */}
+        <header className="flex h-14 items-center justify-between border-b border-neutral-200 bg-white px-3 sm:px-6">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="rounded-lg p-2 text-neutral-600 hover:bg-neutral-100 md:hidden"
+              aria-label="Open menu"
+            >
+              <MenuIcon className="h-5 w-5" />
+            </button>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-neutral-900">
+                {currentChat?.title || (hasChat ? "Loading chat..." : "New Chat")}
+              </div>
+              <div className="truncate text-xs text-neutral-500">
+                {upload.isPending
+                  ? "Processing PDF & generating embeddings..."
+                  : hasChat
+                  ? `${currentDocs.length} document${currentDocs.length === 1 ? "" : "s"} attached`
+                  : "Upload a PDF to create an isolated chat"}
+              </div>
             </div>
           </div>
+
+          {hasChat && (
+            <div className="flex items-center gap-2">
+              <span className="hidden sm:inline-block rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-medium text-emerald-800">
+                Isolated Chat
+              </span>
+            </div>
+          )}
         </header>
 
-        {/* Upload error banner if any */}
+        {/* Global Error Banners */}
         {upload.isError && (
-          <div className="bg-red-50 border-b border-red-200 px-4 py-2 text-xs text-red-700 flex items-center justify-between">
-            <span>Upload error: {upload.error?.message}</span>
+          <div className="flex items-center justify-between bg-red-50 border-b border-red-200 px-4 py-2 text-xs text-red-700">
+            <span>Upload Error: {upload.error?.message}</span>
             <button
               onClick={() => upload.reset()}
-              className="text-xs font-semibold text-red-800 underline hover:text-red-900"
+              className="font-medium underline hover:text-red-900"
             >
               Dismiss
             </button>
           </div>
         )}
 
-        {/* Messages */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto bg-neutral-50">
-          {messages.length === 0 && !upload.isPending ? (
-            <EmptyState ready={ready} onSelectSuggestion={(s) => setInput(s)} />
+        {/* Messages Container */}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto">
+          {localMessages.length === 0 && !upload.isPending ? (
+            <EmptyState
+              ready={isReady}
+              chatTitle={currentChat?.title}
+              onSelectSuggestion={(s) => setSuggestion(s)}
+            />
           ) : (
             <div className="mx-auto max-w-3xl space-y-6 px-3 py-6 sm:px-6 sm:py-8">
-              {messages.map((m, i) =>
+              {localMessages.map((m, i) =>
                 m.role === "user" ? (
                   <UserBubble key={i} text={m.content} />
                 ) : (
-                  <AssistantBubble key={i} text={m.content} sources={m.sources} />
+                  <AssistantBubble
+                    key={i}
+                    text={m.content}
+                    sources={m.sources}
+                  />
                 )
               )}
               {ask.isPending && <ThinkingBubble />}
@@ -140,14 +221,20 @@ export default function Home() {
           )}
         </div>
 
-        {/* Composer */}
+        {/* Composer with Zod validation */}
         <Composer
-          value={input}
-          onChange={setInput}
           onSubmit={handleSend}
-          disabled={!ready}
+          disabled={!hasChat || upload.isPending}
           pending={ask.isPending}
-          placeholder={ready ? "Ask about this document…" : "Upload a PDF first"}
+          placeholder={
+            !hasChat
+              ? "Upload a PDF from the sidebar to start a chat..."
+              : isReady
+              ? "Ask a question about this chat's documents..."
+              : "Attach a PDF to this chat first..."
+          }
+          externalValue={suggestion}
+          onExternalChange={setSuggestion}
         />
       </div>
     </div>
