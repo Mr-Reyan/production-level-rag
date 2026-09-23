@@ -1,9 +1,15 @@
 import logging
+import os
 import requests
+import pdfplumber
 from django.conf import settings
+from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from rag.models import Document
+
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 # Global lazy-loaded embedding model instance (if using local FlagEmbedding)
@@ -26,13 +32,54 @@ def get_local_embed_model():
     return _bge_model if _bge_model is not False else None
 
 
-import pdfplumber
+def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
+    """
+    Reranks candidate chunks using Jina Reranker v2.
+    Falls back gracefully to vector search candidates if API call fails.
+    """
+    if not candidates:
+        return []
+
+    api_key = os.getenv("JINA_API_KEY")
+    if not api_key:
+        logger.warning("JINA_API_KEY not found in environment, returning top candidates without reranking.")
+        return candidates[:top_k]
+
+    try:
+        resp = requests.post(
+            "https://api.jina.ai/v1/rerank",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "jina-reranker-v2-base-multilingual",
+                "query": query,
+                "documents": [c["content"] for c in candidates],
+                "top_n": min(top_k, len(candidates)),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+
+        reranked = []
+        for r in results:
+            idx = r["index"]
+            c = dict(candidates[idx])
+            c["rerank_score"] = round(float(r.get("relevance_score", 0.0)), 4)
+            reranked.append(c)
+        return reranked if reranked else candidates[:top_k]
+    except Exception as e:
+        logger.warning(f"Jina rerank failed: {e}. Falling back to top vector candidates.")
+        return candidates[:top_k]
+
 
 def extract_tables_and_text(pdf_file):
     """
     Returns (plain_text_chunks_source, flattened_table_sentences)
-    Tables are pulled out and converted to standalone sentences;
-    remaining prose is returned separately for normal chunking.
+    Tables are extracted and converted to standalone sentences;
+    remaining prose is returned separately for chunking.
     """
     full_text_parts = []
     table_sentences = []
@@ -58,19 +105,20 @@ def extract_tables_and_text(pdf_file):
                     row = [str(c).strip() if c else "" for c in row]
                     if not any(row):
                         continue
-                    # e.g. "On Multilingual-40, Astra 5 scored 68%, Astra 6
-                    # scored 79%, and Solstice-XL scored 72%."
                     label = row[0]
-                    pairs = [f"{header[i]} scored {row[i]}"
-                             for i in range(1, len(row)) if row[i]]
+                    pairs = [
+                        f"{header[i]} scored {row[i]}"
+                        for i in range(1, len(row))
+                        if row[i]
+                    ]
                     sentence = f"On {label}, " + ", ".join(pairs) + "."
                     table_sentences.append(sentence)
 
             # Extract non-table text on this page, excluding table regions
             page_text = page.filter(
                 lambda obj: not any(
-                    bbox[0] <= obj.get("x0", -1) <= bbox[2] and
-                    bbox[1] <= obj.get("top", -1) <= bbox[3]
+                    bbox[0] <= obj.get("x0", -1) <= bbox[2]
+                    and bbox[1] <= obj.get("top", -1) <= bbox[3]
                     for bbox in table_bboxes
                 )
             ).extract_text() or ""
@@ -79,17 +127,94 @@ def extract_tables_and_text(pdf_file):
     return "\n\n".join(full_text_parts), table_sentences
 
 
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> list[str]:
+    """
+    Split text into manageable chunks with overlap for embedding.
+    """
+    if not text or not text.strip():
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_text(text)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def embed(text: str) -> list[float]:
+    """
+    Generate an embedding vector for a piece of text.
+    Tries local BGEM3FlagModel if loaded; otherwise calls Ollama embeddings API.
+    """
+    if not text or not text.strip():
+        return [0.0] * 1024
+
+    # 1. Try local BGE model if available
+    local_model = get_local_embed_model()
+    if local_model is not None:
+        try:
+            response = local_model.encode(
+                [text],
+                return_dense=True,
+                return_sparse=False,
+                return_colbert_vecs=False,
+            )
+            return response["dense_vecs"][0].tolist()
+        except Exception as e:
+            logger.warning(f"Local BGEM3 encoding failed: {e}. Trying Ollama...")
+
+    # 2. Try Ollama embeddings endpoint
+    ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
+    embed_model = getattr(settings, "OLLAMA_EMBED_MODEL", "bge-m3")
+
+    try:
+        res = requests.post(
+            f"{ollama_url}/api/embeddings",
+            json={"model": embed_model, "prompt": text},
+            timeout=30,
+        )
+        if res.status_code == 200:
+            vec = res.json().get("embedding")
+            if vec and isinstance(vec, list):
+                return vec
+    except Exception as e:
+        logger.warning(f"Ollama /api/embeddings failed: {e}")
+
+    try:
+        res = requests.post(
+            f"{ollama_url}/api/embed",
+            json={"model": embed_model, "input": text},
+            timeout=30,
+        )
+        if res.status_code == 200:
+            embeddings = res.json().get("embeddings", [])
+            if embeddings and len(embeddings) > 0:
+                return embeddings[0]
+    except Exception as e:
+        logger.warning(f"Ollama /api/embed failed: {e}")
+
+    raise RuntimeError(
+        f"Could not generate embedding for text. Ensure Ollama is running at {ollama_url} with model '{embed_model}' or BGEM3FlagModel is available."
+    )
+
+
 def ingest_pdf(file_obj, chat, title, source_id):
+    """
+    Full pipeline: extract prose and tables, chunk prose, vectorize all, and store in DB.
+    """
     plain_text, table_sentences = extract_tables_and_text(file_obj)
 
-    # Normal prose gets the usual token-aware chunking
+    # Normal prose gets token-aware chunking
     prose_chunks = chunk_text(plain_text)
 
-    # Table rows go in as-is, one sentence per chunk, no splitting
+    # Table rows are kept as standalone sentences
     all_chunks = prose_chunks + table_sentences
 
+    created_docs = []
     for i, chunk in enumerate(all_chunks):
-        Document.objects.create(
+        doc = Document.objects.create(
             chat=chat,
             title=title,
             content=chunk,
@@ -97,6 +222,7 @@ def ingest_pdf(file_obj, chat, title, source_id):
             source_id=source_id,
             chunk_index=i,
         )
+        created_docs.append(doc)
     return all_chunks
 
 
@@ -123,7 +249,6 @@ def derive_chat_title(file_obj, fallback_title: str = "New Chat") -> str:
     if not first_lines:
         return fallback_title[:80].strip() or "New Chat"
 
-    # Attempt short title generation via Ollama with strict timeout
     ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
     model = getattr(settings, "OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
 
@@ -144,82 +269,5 @@ def derive_chat_title(file_obj, fallback_title: str = "New Chat") -> str:
     except Exception as e:
         logger.info(f"Ollama title generation skipped/failed ({e}), using fallback.")
 
-    # Fallback to sanitized first line or filename
     cleaned_line = first_lines[:50].strip()
     return cleaned_line if cleaned_line else fallback_title[:50].strip()
-
-
-def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> list[str]:
-    """
-    Split text into manageable chunks with overlap for embedding.
-    """
-    if not text or not text.strip():
-        return []
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_text(text)
-    return [c.strip() for c in chunks if c.strip()]
-
-
-def embed(text: str) -> list[float]:
-    """
-    Generate an embedding vector for a piece of text.
-    First tries local BGEM3FlagModel if loaded; otherwise calls Ollama embeddings API.
-    """
-    if not text or not text.strip():
-        return [0.0] * 1024
-
-    # 1. Try local BGE model if available
-    local_model = get_local_embed_model()
-    if local_model is not None:
-        try:
-            response = local_model.encode(
-                [text],
-                return_dense=True,
-                return_sparse=False,
-                return_colbert_vecs=False,
-            )
-            return response["dense_vecs"][0].tolist()
-        except Exception as e:
-            logger.warning(f"Local BGEM3 encoding failed: {e}. Trying Ollama...")
-
-    # 2. Try Ollama embeddings endpoint
-    ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
-    embed_model = getattr(settings, "OLLAMA_EMBED_MODEL", "bge-m3")
-
-    try:
-        # Try /api/embeddings (standard Ollama endpoint)
-        res = requests.post(
-            f"{ollama_url}/api/embeddings",
-            json={"model": embed_model, "prompt": text},
-            timeout=30,
-        )
-        if res.status_code == 200:
-            vec = res.json().get("embedding")
-            if vec and isinstance(vec, list):
-                return vec
-    except Exception as e:
-        logger.warning(f"Ollama /api/embeddings failed: {e}")
-
-    try:
-        # Try /api/embed (Ollama newer endpoint)
-        res = requests.post(
-            f"{ollama_url}/api/embed",
-            json={"model": embed_model, "input": text},
-            timeout=30,
-        )
-        if res.status_code == 200:
-            embeddings = res.json().get("embeddings", [])
-            if embeddings and len(embeddings) > 0:
-                return embeddings[0]
-    except Exception as e:
-        logger.warning(f"Ollama /api/embed failed: {e}")
-
-    raise RuntimeError(
-        f"Could not generate embedding for text. Ensure Ollama is running at {ollama_url} with model '{embed_model}' or BGEM3FlagModel is available."
-    )
-

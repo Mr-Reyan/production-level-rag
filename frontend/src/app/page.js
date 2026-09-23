@@ -18,17 +18,21 @@ import {
 } from "@/components/chat";
 import { MenuIcon, FileIcon } from "@/components/icons";
 
+import { useQueryClient } from "@tanstack/react-query";
+import { askQuestionStream } from "@/lib/api";
+
 export default function Home() {
   const [activeChatId, setActiveChatId] = useState(null);
   const [suggestion, setSuggestion] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
   const scrollRef = useRef(null);
+  const queryClient = useQueryClient();
 
   const { data: chatsData, isLoading: chatsLoading } = useChats();
   const { data: chatDetailData, isLoading: detailLoading } = useChatDetail(activeChatId);
 
   const upload = useUploadPdf();
-  const ask = useAsk();
   const deleteChatMutation = useDeleteChat();
 
   const chats = chatsData?.chats || [];
@@ -46,7 +50,7 @@ export default function Home() {
         chatDetailData.messages.map((m) => ({
           role: m.sender === "ai" ? "assistant" : "user",
           content: m.text,
-          sources: [],
+          sources: m.sources || [],
         }))
       );
     } else {
@@ -60,7 +64,7 @@ export default function Home() {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [localMessages, ask.isPending]);
+  }, [localMessages, isGenerating]);
 
   function handleUpload(file, targetChatId) {
     upload.mutate(
@@ -93,38 +97,82 @@ export default function Home() {
     });
   }
 
-  function handleSend(questionText) {
+  async function handleSend(questionText) {
     const q = questionText?.trim();
-    if (!q || !activeChatId || ask.isPending) return;
+    if (!q || !activeChatId || isGenerating) return;
 
-    // Add optimistic user message
-    setLocalMessages((m) => [...m, { role: "user", content: q }]);
+    // 1. Add user message + empty assistant placeholder
+    setLocalMessages((prev) => [
+      ...prev,
+      { role: "user", content: q },
+      { role: "assistant", content: "", sources: [] },
+    ]);
+    setIsGenerating(true);
 
-    ask.mutate(
-      { chatId: activeChatId, question: q },
-      {
-        onSuccess: (data) => {
-          setLocalMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              content: data.answer,
-              sources: data.sources || [],
-            },
-          ]);
+    try {
+      await askQuestionStream(activeChatId, q, {
+        onSources: (sources) => {
+          setLocalMessages((prev) => {
+            const copy = [...prev];
+            if (copy.length > 0) {
+              const last = copy[copy.length - 1];
+              if (last.role === "assistant") {
+                copy[copy.length - 1] = { ...last, sources };
+              }
+            }
+            return copy;
+          });
+        },
+        onToken: (token) => {
+          setLocalMessages((prev) => {
+            const copy = [...prev];
+            if (copy.length > 0) {
+              const last = copy[copy.length - 1];
+              if (last.role === "assistant") {
+                copy[copy.length - 1] = { ...last, content: last.content + token };
+              }
+            }
+            return copy;
+          });
+        },
+        onDone: () => {
+          setIsGenerating(false);
+          queryClient.invalidateQueries({ queryKey: ["chat", activeChatId] });
+          queryClient.invalidateQueries({ queryKey: ["chats"] });
         },
         onError: (err) => {
-          setLocalMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              content: `Error: ${err.message}`,
-              sources: [],
-            },
-          ]);
+          setIsGenerating(false);
+          setLocalMessages((prev) => {
+            const copy = [...prev];
+            if (copy.length > 0) {
+              const last = copy[copy.length - 1];
+              if (last.role === "assistant") {
+                copy[copy.length - 1] = {
+                  ...last,
+                  content: `Error: ${err.message || "Failed to generate answer"}`,
+                };
+              }
+            }
+            return copy;
+          });
         },
-      }
-    );
+      });
+    } catch (err) {
+      setIsGenerating(false);
+      setLocalMessages((prev) => {
+        const copy = [...prev];
+        if (copy.length > 0) {
+          const last = copy[copy.length - 1];
+          if (last.role === "assistant" && !last.content) {
+            copy[copy.length - 1] = {
+              ...last,
+              content: `Error: ${err.message || "Failed to connect"}`,
+            };
+          }
+        }
+        return copy;
+      });
+    }
   }
 
   const hasChat = !!activeChatId;
@@ -209,14 +257,19 @@ export default function Home() {
                 m.role === "user" ? (
                   <UserBubble key={i} text={m.content} />
                 ) : (
-                  <AssistantBubble
-                    key={i}
-                    text={m.content}
-                    sources={m.sources}
-                  />
+                  m.content ? (
+                    <AssistantBubble
+                      key={i}
+                      text={m.content}
+                      sources={m.sources}
+                    />
+                  ) : (
+                    isGenerating && i === localMessages.length - 1 ? (
+                      <ThinkingBubble key={i} />
+                    ) : null
+                  )
                 )
               )}
-              {ask.isPending && <ThinkingBubble />}
             </div>
           )}
         </div>
@@ -224,8 +277,8 @@ export default function Home() {
         {/* Composer with Zod validation */}
         <Composer
           onSubmit={handleSend}
-          disabled={!hasChat || upload.isPending}
-          pending={ask.isPending}
+          disabled={!hasChat || upload.isPending || isGenerating}
+          pending={isGenerating}
           placeholder={
             !hasChat
               ? "Upload a PDF from the sidebar to start a chat..."

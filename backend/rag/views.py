@@ -1,93 +1,23 @@
 import json
 import logging
+import time
 import uuid
 import requests
 from django.conf import settings
 from django.db import connection, transaction
-from django.http import JsonResponse
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
 
-from rag.models import Chats, Message, Document
-from rag.services import embed, derive_chat_title, ingest_pdf, extract_tables_and_text
+from chats.models import Chats, Message
+from chats.services import (
+    get_recent_messages,
+    should_retrieve,
+    auto_summarize_if_exceeds_budget,
+)
+from rag.services import derive_chat_title, embed, ingest_pdf, rerank
 
 logger = logging.getLogger(__name__)
-
-
-@csrf_exempt
-@api_view(["GET"])
-def list_chats(request):
-    """
-    List all active chats ordered by latest creation.
-    """
-    try:
-        chats = Chats.objects.filter(deleted_at__isnull=True).order_by("-created_at")
-        data = [
-            {
-                "id": str(chat.id),
-                "title": chat.title,
-                "created_at": chat.created_at.isoformat() if chat.created_at else None,
-                "message_count": chat.messages.count(),
-            }
-            for chat in chats
-        ]
-        return JsonResponse({"chats": data}, status=200)
-    except Exception as e:
-        logger.error(f"Error listing chats: {e}", exc_info=True)
-        return JsonResponse({"error": f"Failed to list chats: {str(e)}"}, status=500)
-
-
-@csrf_exempt
-@api_view(["GET", "DELETE"])
-def chat_detail(request, chat_id):
-    """
-    GET: Retrieve chat info, message history, and associated documents.
-    DELETE: Soft-delete a chat.
-    """
-    chat = Chats.objects.filter(id=chat_id, deleted_at__isnull=True).first()
-    if not chat:
-        return JsonResponse({"error": "Chat not found"}, status=404)
-
-    if request.method == "DELETE":
-        try:
-            chat.deleted_at = timezone.now()
-            chat.save(update_fields=["deleted_at"])
-            return JsonResponse({"message": "Chat deleted successfully", "chat_id": str(chat.id)}, status=200)
-        except Exception as e:
-            return JsonResponse({"error": f"Failed to delete chat: {str(e)}"}, status=500)
-
-    # GET: return chat details, messages, and uploaded document titles
-    try:
-        messages = [
-            {
-                "id": m.id,
-                "sender": m.sender,
-                "text": m.text,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-            }
-            for m in chat.messages.all().order_by("created_at")
-        ]
-        docs = list(
-            chat.documents.values("source_id", "title")
-            .distinct()
-        )
-        return JsonResponse(
-            {
-                "chat": {
-                    "id": str(chat.id),
-                    "title": chat.title,
-                    "created_at": chat.created_at.isoformat() if chat.created_at else None,
-                },
-                "messages": messages,
-                "documents": [{"source_id": str(d["source_id"]), "title": d["title"]} for d in docs],
-            },
-            status=200,
-        )
-    except Exception as e:
-        logger.error(f"Error fetching chat detail: {e}", exc_info=True)
-        return JsonResponse({"error": f"Failed to fetch chat details: {str(e)}"}, status=500)
 
 
 @csrf_exempt
@@ -95,7 +25,7 @@ def chat_detail(request, chat_id):
 def upload_pdf(request):
     """
     Upload a PDF document.
-    - If `chat_id` is provided in POST body or query params, attaches the PDF chunks to that chat.
+    - If `chat_id` is provided, attaches the PDF chunks to that chat.
     - If `chat_id` is omitted, automatically creates a new Chat with a new UUID and derived title.
     """
     if "file" not in request.FILES:
@@ -105,7 +35,6 @@ def upload_pdf(request):
     if not pdf_file.name.lower().endswith(".pdf"):
         return JsonResponse({"error": "Only PDF files are supported"}, status=400)
 
-    # Check if a chat_id was provided
     chat_id = request.POST.get("chat_id") or request.GET.get("chat_id") or request.data.get("chat_id")
     chat = None
 
@@ -114,7 +43,6 @@ def upload_pdf(request):
         if not chat:
             return JsonResponse({"error": f"Chat with ID '{chat_id}' does not exist"}, status=404)
 
-    # Derive chat title if this is a new chat
     chat_title = None
     if not chat:
         try:
@@ -157,11 +85,12 @@ def upload_pdf(request):
 def ask(request):
     """
     RAG Question Answering strictly isolated to the specified `chat_id`.
-    - Stores the user's question in Message table.
-    - Performs vector similarity search strictly on Document rows belonging to `chat_id`.
-    - Generates an answer from context via Ollama.
-    - Stores the AI answer in Message table.
+    - Streams tokens in real-time to the frontend (SSE stream).
+    - Prints detailed latency breakdowns to the terminal.
+    - Intent router runs on fast llama3.2:3b.
+    - Retrieval fetches top 10 from pgvector and reranks to top 5 with Jina.
     """
+    t_start = time.time()
     try:
         body = json.loads(request.body) if request.body else request.data
     except Exception:
@@ -180,126 +109,171 @@ def ask(request):
     if not chat:
         return JsonResponse({"error": f"Chat with ID '{chat_id}' does not exist"}, status=404)
 
+    print("\n" + "=" * 60)
+    print(f"📥 [REQUEST RECEIVED] Chat: {chat_id} | Query: '{question}'")
+
     # 1. Record the user message
     try:
         Message.objects.create(chat=chat, text=question, sender="user")
     except Exception as e:
         logger.warning(f"Could not save user message: {e}")
 
-    # 2. Embed the question
-    try:
-        query_vector = embed(question)
-    except Exception as e:
-        return JsonResponse({"error": f"Failed to generate embedding for query: {str(e)}"}, status=500)
+    # 2. Check token budget (background auto-summarization only if >= 2000 tokens)
+    auto_summarize_if_exceeds_budget(chat, token_threshold=2000)
 
-    # 3. Chat-isolated pgvector similarity search
-    # Strictly filters `WHERE chat_id = %s` so no cross-chat context can ever leak
+    # 3. Fetch recent 10 messages (up to 5 user + 5 AI)
+    recent_msgs = get_recent_messages(chat, user_limit=5, ai_limit=5)
+    recent_history_text = "\n".join(
+        f"{'User' if m.sender == 'user' else 'Assistant'}: {m.text}" for m in recent_msgs
+    )
+
+    # 4. Fast, cheap AI router using llama3.2:3b
+    t_router = time.time()
+    needs_retrieval = should_retrieve(
+        query=question,
+        recent_history_text=recent_history_text,
+        summary=chat.summary,
+    )
+    router_time = time.time() - t_router
+    print(f"⏱️ [Intent Router] Decision: {'RETRIEVE' if needs_retrieval else 'SKIP'} ({router_time:.2f}s using llama3.2:3b)")
+
     chunks = []
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, content, source_id, title, (1 - (embedding <=> %s::vector)) AS similarity
-                FROM rag_document
-                WHERE chat_id = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                [query_vector, str(chat.id), query_vector, 5],
-            )
-            rows = cur.fetchall()
+    if needs_retrieval:
+        t_ret = time.time()
+        try:
+            # Embed question
+            query_vector = embed(question)
 
-        chunks = [
-            {
-                "id": r[0],
-                "content": r[1],
-                "source_id": str(r[2]),
-                "title": r[3],
-                "similarity": round(float(r[4]), 4),
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}", exc_info=True)
-        return JsonResponse({"error": f"Vector similarity search failed: {str(e)}"}, status=500)
+            # Chat-isolated pgvector similarity search (fetch top 10)
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, content, source_id, title, (1 - (embedding <=> %s::vector)) AS similarity
+                    FROM rag_document
+                    WHERE chat_id = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT 10
+                    """,
+                    [query_vector, str(chat.id), query_vector],
+                )
+                rows = cur.fetchall()
 
-    # If no documents are attached to this chat
-    if not chunks:
-        fallback_answer = "I don't have any documents uploaded in this chat to answer your question. Please upload a PDF to this chat first."
-        Message.objects.create(chat=chat, text=fallback_answer, sender="ai")
-        return JsonResponse(
-            {
-                "chat_id": str(chat.id),
-                "answer": fallback_answer,
-                "sources": [],
-            },
-            status=200,
+            raw_chunks = [
+                {
+                    "id": r[0],
+                    "content": r[1],
+                    "source_id": str(r[2]),
+                    "title": r[3],
+                    "similarity": round(float(r[4]), 4),
+                }
+                for r in rows
+            ]
+
+            # Rerank top 10 candidates to top 5 using Jina Reranker
+            if raw_chunks:
+                chunks = rerank(question, raw_chunks, top_k=5)
+
+            ret_time = time.time() - t_ret
+            print(f"⏱️ [Retrieval & Rerank] Retrieved {len(raw_chunks)} chunks, reranked top {len(chunks)} in {ret_time:.2f}s")
+        except Exception as e:
+            logger.error(f"Vector search or reranking failed: {e}", exc_info=True)
+            chunks = []
+
+    # 5. Construct comprehensive prompt
+    prompt_sections = [
+        "You are a helpful, highly capable, and precise AI assistant in a Document Q&A system."
+    ]
+
+    if chat.summary and chat.summary.strip():
+        prompt_sections.append(f"### Previous Conversation Summary:\n{chat.summary.strip()}")
+
+    if recent_history_text:
+        prompt_sections.append(f"### Recent Conversation History:\n{recent_history_text}")
+
+    if chunks:
+        doc_context = "\n\n---\n\n".join(
+            f"[From '{c['title']}']:\n{c['content']}" for c in chunks
+        )
+        prompt_sections.append(f"### Relevant Document Context:\n{doc_context}")
+        prompt_sections.append(
+            "Instructions: Answer the question accurately using the provided document context and conversation history. "
+            "If the answer cannot be found in the provided context or history, say \"I don't know based on the provided documents in this chat.\" "
+            "Do not guess or hallucinate."
+        )
+    else:
+        prompt_sections.append(
+            "Instructions: Answer the user's question clearly, politely, and helpfully using the conversation context above."
         )
 
-    # 4. Construct context and prompt
-    context_text = "\n\n---\n\n".join(
-        f"[From '{c['title']}']:\n{c['content']}" for c in chunks
-    )
-    prompt = f"""You are a helpful and precise assistant. Answer the question using ONLY the provided document context below.
-If the answer cannot be found in the provided context, answer with: "I don't know based on the provided documents in this chat."
-Do not guess, hallucinate, or use outside unverified facts.
-
-Context:
-{context_text}
-
-Question: {question}
-Answer:"""
+    prompt_sections.append(f"User Question: {question}\nAnswer:")
+    full_prompt = "\n\n".join(prompt_sections)
 
     ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
     model = getattr(settings, "OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
 
-    try:
-        res = requests.post(
-            f"{ollama_url}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=120,
-        )
-        if res.status_code != 200:
-            err_msg = res.text
-            try:
-                err_msg = res.json().get("error", res.text)
-            except Exception:
-                pass
-            return JsonResponse(
-                {"error": f"Ollama generation failed ({res.status_code}): {err_msg}"},
-                status=502,
+    print(f"🚀 [LLM Generation Started] Model: {model} | Elapsed so far: {time.time() - t_start:.2f}s")
+
+    # 6. Stream tokens via SSE
+    def event_stream():
+        # Emit initial sources metadata event
+        yield f"data: {json.dumps({'type': 'sources', 'sources': chunks, 'retrieval_used': bool(chunks and needs_retrieval)})}\n\n"
+
+        full_answer_chunks = []
+        ttft_recorded = False
+
+        try:
+            res = requests.post(
+                f"{ollama_url}/api/generate",
+                json={"model": model, "prompt": full_prompt, "stream": True},
+                stream=True,
+                timeout=120,
             )
 
-        llm_response = res.json()
-        answer = llm_response.get("response", "").strip()
-        if not answer:
-            answer = "Unable to generate a response from LLM."
+            if res.status_code != 200:
+                err_msg = f"Ollama generation error ({res.status_code})"
+                yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
+                return
 
-        # 5. Record the AI response
-        Message.objects.create(chat=chat, text=answer, sender="ai")
+            for line in res.iter_lines():
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line.decode("utf-8"))
+                    token = payload.get("response", "")
+                    if token:
+                        if not ttft_recorded:
+                            ttft = time.time() - t_start
+                            print(f"⚡ [TTFT - Time To First Token] {ttft:.2f}s from send click!")
+                            ttft_recorded = True
+                        full_answer_chunks.append(token)
+                        yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
-        return JsonResponse(
-            {
-                "chat_id": str(chat.id),
-                "answer": answer,
-                "sources": chunks,
-            },
-            status=200,
-        )
+                    if payload.get("done", False):
+                        break
+                except Exception as parse_err:
+                    logger.warning(f"Error parsing stream chunk: {parse_err}")
+                    continue
 
-    except requests.exceptions.ConnectionError:
-        return JsonResponse(
-            {
-                "error": f"Could not connect to Ollama at {ollama_url}. Please ensure Ollama is running (`ollama serve`)."
-            },
-            status=502,
-        )
-    except requests.exceptions.Timeout:
-        return JsonResponse(
-            {"error": "LLM generation timed out after 120 seconds."},
-            status=504,
-        )
-    except Exception as e:
-        logger.error(f"LLM generation failed: {e}", exc_info=True)
-        return JsonResponse({"error": f"Generation error: {str(e)}"}, status=500)
+        except Exception as stream_err:
+            logger.error(f"Streaming error: {stream_err}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'error': str(stream_err)})}\n\n"
 
+        total_req_time = time.time() - t_start
+        print(f"✅ [Total Request Completed] Finished streaming in {total_req_time:.2f}s total.")
+        print("=" * 60 + "\n")
+
+        full_answer = "".join(full_answer_chunks).strip() or "Unable to generate a response from LLM."
+
+        # Save AI message with sources
+        try:
+            Message.objects.create(chat=chat, text=full_answer, sender="ai", sources=chunks)
+            auto_summarize_if_exceeds_budget(chat, token_threshold=2000)
+        except Exception as e:
+            logger.warning(f"Could not save AI message: {e}")
+
+        yield f"data: {json.dumps({'type': 'done', 'total_time': round(total_req_time, 2)})}\n\n"
+
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
