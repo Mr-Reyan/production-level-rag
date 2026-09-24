@@ -1,3 +1,4 @@
+from sqlalchemy import true
 import uuid
 from django.db import models
 
@@ -24,6 +25,8 @@ class Chats(models.Model):
 class Message(models.Model):
     chat = models.ForeignKey(Chats, on_delete=models.CASCADE, related_name="messages")
     text = models.TextField()
+    retrieved_chunk_ids = models.JSONField(default=list, blank=True)
+    trace_id = models.CharField(max_length=64, blank=True, default="")
     sender = models.CharField(choices=SENDER_ROLES, max_length=5, default="user")
     sources = models.JSONField(null=True, blank=True, default=list)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -16,6 +16,7 @@ from chats.services import (
     auto_summarize_if_exceeds_budget,
 )
 from rag.services import derive_chat_title, embed, ingest_pdf, rerank
+from observability.langfuse_client import langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -112,22 +113,35 @@ def ask(request):
     print("\n" + "=" * 60)
     print(f"📥 [REQUEST RECEIVED] Chat: {chat_id} | Query: '{question}'")
 
-    # 1. Record the user message
-    try:
-        Message.objects.create(chat=chat, text=question, sender="user")
-    except Exception as e:
-        logger.warning(f"Could not save user message: {e}")
-
-    # 2. Check token budget (background auto-summarization only if >= 2000 tokens)
-    auto_summarize_if_exceeds_budget(chat, token_threshold=2000)
-
-    # 3. Fetch recent 10 messages (up to 5 user + 5 AI)
+    # 1. Fetch prior recent 10 messages (up to 5 user + 5 AI) before adding current question
     recent_msgs = get_recent_messages(chat, user_limit=5, ai_limit=5)
     recent_history_text = "\n".join(
         f"{'User' if m.sender == 'user' else 'Assistant'}: {m.text}" for m in recent_msgs
     )
 
-    # 4. Fast, cheap AI router using llama3.2:3b
+    # 2. Record the user message
+    try:
+        Message.objects.create(chat=chat, text=question, sender="user")
+    except Exception as e:
+        logger.warning(f"Could not save user message: {e}")
+
+    ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
+    model = getattr(settings, "OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
+
+    trace = langfuse.start_observation(
+        name="rag-ask",
+        as_type="span",
+        input={"question": question, "chat_id": str(chat.id)},
+        metadata={"model": model, "chat_id": str(chat.id)},
+    )
+    trace_id = trace.trace_id
+    print(f"Trace ID: {trace_id}")
+    retrieval_span = trace.start_observation(name="retrieval", as_type="retriever", input={"query": question})
+
+    # 3. Check token budget (background auto-summarization only if >= 2000 tokens)
+    auto_summarize_if_exceeds_budget(chat, token_threshold=2000)
+
+    # 4. Intent router
     t_router = time.time()
     needs_retrieval = should_retrieve(
         query=question,
@@ -135,9 +149,12 @@ def ask(request):
         summary=chat.summary,
     )
     router_time = time.time() - t_router
-    print(f"⏱️ [Intent Router] Decision: {'RETRIEVE' if needs_retrieval else 'SKIP'} ({router_time:.2f}s using llama3.2:3b)")
+    print(f"⏱️ [Intent Router] Decision: {'RETRIEVE' if needs_retrieval else 'SKIP'} ({router_time:.2f}s)")
 
     chunks = []
+    raw_chunks = []
+    ret_time = 0.0
+    reranked_flag = False
     if needs_retrieval:
         t_ret = time.time()
         try:
@@ -152,7 +169,7 @@ def ask(request):
                     FROM rag_document
                     WHERE chat_id = %s
                     ORDER BY embedding <=> %s::vector
-                    LIMIT 10
+                    LIMIT 6
                     """,
                     [query_vector, str(chat.id), query_vector],
                 )
@@ -171,13 +188,28 @@ def ask(request):
 
             # Rerank top 10 candidates to top 5 using Jina Reranker
             if raw_chunks:
-                chunks = rerank(question, raw_chunks, top_k=5)
+                chunks, reranked_flag = rerank(question, raw_chunks, top_k=3)
+                if not reranked_flag:
+                    print("⚠️ [Rerank] Using vector-only chunks (API fallback).")
 
             ret_time = time.time() - t_ret
             print(f"⏱️ [Retrieval & Rerank] Retrieved {len(raw_chunks)} chunks, reranked top {len(chunks)} in {ret_time:.2f}s")
         except Exception as e:
             logger.error(f"Vector search or reranking failed: {e}", exc_info=True)
             chunks = []
+
+    retrieval_span.update(
+        output={"chunks": chunks},
+        metadata={
+            "needs_retrieval": needs_retrieval,
+            "reranked": reranked_flag,
+            "raw_count": len(raw_chunks) if needs_retrieval else 0,
+            "final_count": len(chunks),
+            "router_time_s": round(router_time, 3),
+            "retrieval_time_s": round(ret_time, 3) if needs_retrieval else 0,
+        },
+    )
+    retrieval_span.end()
 
     # 5. Construct comprehensive prompt
     prompt_sections = [
@@ -208,10 +240,15 @@ def ask(request):
     prompt_sections.append(f"User Question: {question}\nAnswer:")
     full_prompt = "\n\n".join(prompt_sections)
 
-    ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
-    model = getattr(settings, "OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
-
     print(f"🚀 [LLM Generation Started] Model: {model} | Elapsed so far: {time.time() - t_start:.2f}s")
+
+    generation = trace.start_observation(
+        name="llm-generation",
+        as_type="generation",
+        model=model,
+        input=full_prompt,
+        metadata={"provider": "ollama"},
+    )
 
     # 6. Stream tokens via SSE
     def event_stream():
@@ -224,7 +261,15 @@ def ask(request):
         try:
             res = requests.post(
                 f"{ollama_url}/api/generate",
-                json={"model": model, "prompt": full_prompt, "stream": True},
+                json={
+                    "model": model,
+                    "prompt": full_prompt,
+                    "stream": True,
+                    "keep_alive": "30m",         
+                    "options": {
+                        "num_ctx": 4096,         
+                    },
+                },
                 stream=True,
                 timeout=120,
             )
@@ -232,7 +277,14 @@ def ask(request):
             if res.status_code != 200:
                 err_msg = f"Ollama generation error ({res.status_code})"
                 yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
+                generation.update(output=None, level="ERROR", status_message=err_msg)
+                generation.end()
+                trace.update(output=None, level="ERROR", status_message=err_msg)
+                trace.end()
+                langfuse.flush()
                 return
+
+            final_usage = {}
 
             for line in res.iter_lines():
                 if not line:
@@ -249,6 +301,11 @@ def ask(request):
                         yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
                     if payload.get("done", False):
+                        final_usage = {
+                            "input": payload.get("prompt_eval_count", 0),
+                            "output": payload.get("eval_count", 0),
+                            "total": payload.get("prompt_eval_count", 0) + payload.get("eval_count", 0),
+                        }
                         break
                 except Exception as parse_err:
                     logger.warning(f"Error parsing stream chunk: {parse_err}")
@@ -256,7 +313,13 @@ def ask(request):
 
         except Exception as stream_err:
             logger.error(f"Streaming error: {stream_err}", exc_info=True)
+            generation.update(output=None, level="ERROR", status_message=str(stream_err))
+            generation.end()
+            trace.update(output=None, level="ERROR", status_message=str(stream_err))
+            trace.end()
             yield f"data: {json.dumps({'type': 'error', 'error': str(stream_err)})}\n\n"
+            langfuse.flush()
+            return
 
         total_req_time = time.time() - t_start
         print(f"✅ [Total Request Completed] Finished streaming in {total_req_time:.2f}s total.")
@@ -264,14 +327,28 @@ def ask(request):
 
         full_answer = "".join(full_answer_chunks).strip() or "Unable to generate a response from LLM."
 
+        generation.update(
+            output=full_answer,
+            usage_details=final_usage or None,
+            metadata={"total_time_s": round(total_req_time, 3)},
+        )
+        generation.end()
+
+        trace.update(output=full_answer)
+        trace.end()
+
         # Save AI message with sources
         try:
-            Message.objects.create(chat=chat, text=full_answer, sender="ai", sources=chunks)
+            retrieved_chunk_ids = [c["id"] for c in chunks]
+            Message.objects.create(chat=chat, text=full_answer, sender="ai", sources=chunks, retrieved_chunk_ids=retrieved_chunk_ids, trace_id=trace_id)
+
             auto_summarize_if_exceeds_budget(chat, token_threshold=2000)
         except Exception as e:
             logger.warning(f"Could not save AI message: {e}")
 
         yield f"data: {json.dumps({'type': 'done', 'total_time': round(total_req_time, 2)})}\n\n"
+
+        langfuse.flush()
 
     response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
     response["Cache-Control"] = "no-cache"

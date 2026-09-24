@@ -5,7 +5,6 @@ import {
   useChats,
   useChatDetail,
   useUploadPdf,
-  useAsk,
   useDeleteChat,
 } from "@/hooks/use-rag";
 import { Sidebar } from "@/components/Sidebar";

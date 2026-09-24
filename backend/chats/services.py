@@ -134,55 +134,40 @@ def auto_summarize_if_exceeds_budget(chat, token_threshold: int = 2000) -> bool:
         return True
     return False
 
+import re
+
+TRIVIAL_EXACT = {
+    "hi", "hello", "hey", "thanks", "thank you", "thx", "bye", "goodbye",
+    "ok", "okay", "cool", "great", "yes", "no", "sure", "nice", "yep", "nope",
+    "who are you", "what can you do", "help", "how are you", "whats up", "what is up",
+}
+
+# Only pure small-talk / bot-identity queries should skip retrieval
+GENERAL_PATTERNS = [
+    r"^(hi|hello|hey|greetings|howdy)\b",
+    r"^tell me (a )?(joke|riddle)",
+    r"^how are you",
+    r"^who (are|created|made) you",
+    r"^what can you do",
+]
 
 def should_retrieve(query: str, recent_history_text: str = "", summary: str = "") -> bool:
     """
-    Fast intent check using llama3.2:3b to determine if the query requires retrieving new chunks
-    from the pgvector document database, or if it is a conversational remark/follow-up.
+    Determines if document retrieval is needed for the query.
+    In a Document Q&A system, substantive queries should retrieve context by default,
+    skipping only for conversational greetings and trivial small talk.
     """
-    clean_q = query.strip().lower()
+    q = query.strip().lower()
+    q_clean = re.sub(r"[^\w\s]", "", q).strip()
 
-    # Fast heuristics for trivial conversational queries
-    trivial_phrases = {
-        "hi", "hello", "hey", "thanks", "thank you", "bye", "goodbye",
-        "ok", "okay", "cool", "great", "who are you", "what can you do",
-    }
-    if clean_q in trivial_phrases or clean_q.rstrip("!?.") in trivial_phrases:
+    # 1. Trivial greeting / acknowledgment exact match
+    if q_clean in TRIVIAL_EXACT:
         return False
 
-    ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
-    model = getattr(settings, "OLLAMA_ROUTER_MODEL", "llama3.2:3b")
+    # 2. Pure small talk patterns
+    for pat in GENERAL_PATTERNS:
+        if re.search(pat, q_clean):
+            return False
 
-    prompt = f"""You are a query router for a Document Q&A system.
-Determine if answering requires searching and retrieving factual information from an uploaded document (YES), or if it can be answered purely using general conversational knowledge or recent chat context (NO) (e.g. "what was the 2nd one?", "explain more", "summarize what we discussed", greetings).
-
-Recent Chat:
-{recent_history_text[-400:] if recent_history_text else "No prior history"}
-
-User Query: "{query}"
-
-Respond with ONLY the word "YES" or "NO".
-Decision:"""
-
-    try:
-        res = requests.post(
-            f"{ollama_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 5},
-            },
-            timeout=5,
-        )
-        if res.status_code == 200:
-            decision = res.json().get("response", "").strip().upper()
-            if "NO" in decision and "YES" not in decision:
-                return False
-            if "YES" in decision:
-                return True
-    except Exception as e:
-        logger.info(f"Intent router fallback ({e}), defaulting to retrieval.")
-
-    # Safe default: perform retrieval so no document context is missed
+    # 3. For all informational queries and questions, perform retrieval
     return True

@@ -147,3 +147,4 @@ CORS_ALLOW_ALL_ORIGINS = DEBUG
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "gemma4:31b-cloud")
+OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_ROUTER_MODEL","qwen2.5:0.5b")

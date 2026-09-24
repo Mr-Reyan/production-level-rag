@@ -20,7 +20,21 @@ export async function uploadPdf(file, chatId = null) {
   return res.json();
 }
 
-export async function askQuestionStream(chatId, question, { onToken, onSources, onDone, onError }) {
+export async function askQuestion(chatId, question) {
+  let answer = "";
+  let sources = [];
+  await askQuestionStream(chatId, question, {
+    onToken: (t) => {
+      answer += t;
+    },
+    onSources: (s) => {
+      sources = s;
+    },
+  });
+  return { answer, sources };
+}
+
+export async function askQuestionStream(chatId, question, { onToken, onSources, onDone, onError } = {}) {
   const res = await fetch(`${API_URL}/ask/`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

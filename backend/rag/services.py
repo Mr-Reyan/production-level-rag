@@ -31,19 +31,20 @@ def get_local_embed_model():
             _bge_model = False
     return _bge_model if _bge_model is not False else None
 
-
-def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
+def rerank(query: str, candidates: list[dict], top_k: int = 5) -> tuple[list[dict], bool]:
     """
     Reranks candidate chunks using Jina Reranker v2.
-    Falls back gracefully to vector search candidates if API call fails.
+    Returns (chunks, reranked_flag).
+    - chunks: top_k chunks, ordered by rerank score (or vector score on failure)
+    - reranked_flag: True if Jina actually reranked; False if we fell back
     """
     if not candidates:
-        return []
+        return [], False
 
     api_key = os.getenv("JINA_API_KEY")
     if not api_key:
-        logger.warning("JINA_API_KEY not found in environment, returning top candidates without reranking.")
-        return candidates[:top_k]
+        logger.warning("JINA_API_KEY not found. Returning top vector candidates without reranking.")
+        return candidates[:top_k], False
 
     try:
         resp = requests.post(
@@ -58,7 +59,7 @@ def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
                 "documents": [c["content"] for c in candidates],
                 "top_n": min(top_k, len(candidates)),
             },
-            timeout=30,
+            timeout=8,
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
@@ -69,12 +70,22 @@ def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
             c = dict(candidates[idx])
             c["rerank_score"] = round(float(r.get("relevance_score", 0.0)), 4)
             reranked.append(c)
-        return reranked if reranked else candidates[:top_k]
+
+        if reranked:
+            return reranked, True
+        return candidates[:top_k], False
+
+    except requests.exceptions.Timeout as e:
+        logger.warning(f"Jina rerank timed out: {e}. Falling back.")
+        return candidates[:top_k], False
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Jina rerank HTTP error: {e}. Falling back.")
+        return candidates[:top_k], False
     except Exception as e:
-        logger.warning(f"Jina rerank failed: {e}. Falling back to top vector candidates.")
-        return candidates[:top_k]
+        logger.error(f"Jina rerank unexpected failure: {e}", exc_info=True)
+        return candidates[:top_k], False
 
-
+        
 def extract_tables_and_text(pdf_file):
     """
     Returns (plain_text_chunks_source, flattened_table_sentences)
